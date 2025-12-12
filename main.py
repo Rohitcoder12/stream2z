@@ -7,12 +7,11 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import URLInputFile
-from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("BOT_TOKEN") 
-# If testing locally, uncomment below:
-# TOKEN = "YOUR_BOT_TOKEN_HERE"
+# TOKEN = "YOUR_TOKEN_HERE" # For local testing
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +23,7 @@ dp = Dispatcher()
 
 # --- WEB SERVER (REQUIRED FOR RENDER) ---
 async def health_check(request):
-    return web.Response(text="StreamA2Z Bot is Alive!")
+    return web.Response(text="Bot is Active")
 
 async def start_web_server():
     app = web.Application()
@@ -36,135 +35,125 @@ async def start_web_server():
     await site.start()
     logger.info(f"Web server running on port {port}")
 
-# --- CORE EXTRACTION LOGIC ---
-async def get_stream_url(session, initial_url):
+# --- HELPER: EXTRACT VIDEO ID ---
+def get_video_id_from_url(url):
     """
-    If the user sends a smartkhabrinews link, we need to find the 
-    streama2z iframe source first.
+    Extracts the ID 'a67dnohmamur' from:
+    1. https://smartkhabrinews.com/.../#a67dnohmamur
+    2. https://streama2z.pro/e/a67dnohmamur
     """
-    if "streama2z" in initial_url:
-        return initial_url
-
-    try:
-        async with session.get(initial_url) as response:
-            text = await response.text()
-            soup = BeautifulSoup(text, 'html.parser')
-            
-            # Method 1: Look for iframe
-            iframe = soup.find('iframe')
-            if iframe and "streama2z" in iframe.get('src', ''):
-                return iframe.get('src')
-            
-            # Method 2: Regex search in source code
-            match = re.search(r'(https?://(?:www\.)?streama2z\.(?:pro|com|xyz|net)/[^\s"\']+)', text)
-            if match:
-                return match.group(1)
-                
-    except Exception as e:
-        logger.error(f"Error finding iframe: {e}")
+    parsed = urlparse(url)
     
+    # Check if ID is in the hash (anchor) #a67dnohmamur
+    if parsed.fragment:
+        return parsed.fragment
+    
+    # Check if ID is in the path for streama2z links
+    path_parts = parsed.path.split('/')
+    for part in path_parts:
+        if len(part) > 10 and part.isalnum(): # IDs are usually alphanumeric long strings
+            return part
+            
     return None
 
+# --- CORE LOGIC ---
 async def extract_mp4(target_url):
-    """
-    Visits the StreamA2Z link and extracts the .mp4 file path 
-    hidden in the JavaScript player.
-    """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        "Referer": "https://smartkhabrinews.com/",  # Crucial for bypassing protection
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://smartkhabrinews.com/", 
         "Origin": "https://smartkhabrinews.com"
     }
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        # Step 1: Resolve the actual StreamA2Z URL (if wrapped in news site)
-        stream_link = await get_stream_url(session, target_url)
-        
-        if not stream_link:
-            return None, "Could not find a StreamA2Z video on that page."
-        
-        logger.info(f"Processing Stream Link: {stream_link}")
+    # CASE 1: USER SENT A DIRECT MP4 LINK
+    if target_url.endswith(".mp4"):
+        return target_url, None
 
-        # Step 2: Fetch the StreamA2Z page source
-        # We update referer to itself to ensure it loads
-        headers['Referer'] = stream_link 
+    async with aiohttp.ClientSession(headers=headers) as session:
+        # CASE 2: USER SENT SMARTKHABRI LINK
+        video_id = get_video_id_from_url(target_url)
         
-        async with session.get(stream_link, headers=headers) as response:
+        if not video_id:
+            # Fallback: Try to scrape the page if no ID found in URL
+            try:
+                async with session.get(target_url) as resp:
+                    text = await resp.text()
+                    # Look for embed URL in page source
+                    match = re.search(r'streama2z\.(?:pro|com)/e/([a-zA-Z0-9]+)', text)
+                    if match:
+                        video_id = match.group(1)
+            except:
+                pass
+
+        if not video_id:
+             return None, "Could not identify Video ID. Please ensure URL ends with #ID"
+
+        # Construct the embed URL
+        embed_url = f"https://streama2z.pro/e/{video_id}"
+        logger.info(f"Scraping Embed URL: {embed_url}")
+
+        # Update headers for the embed page
+        headers['Referer'] = embed_url
+        
+        async with session.get(embed_url, headers=headers) as response:
             if response.status != 200:
                 return None, f"Stream host returned error: {response.status}"
             
             html_content = await response.text()
 
-        # Step 3: Regex Magic to find the MP4
-        # Patterns often used by JWPlayer/P2P players on these sites:
+        # Extract MP4 using Regex
+        # 1. Look for 'file': 'url'
+        # 2. Look for just any http link ending in .mp4
         patterns = [
-            r'file\s*:\s*["\'](https?://[^"\']+\.mp4)["\']',  # Standard file: "url"
-            r'sources\s*:\s*\[\s*{\s*file\s*:\s*["\']([^"\']+\.mp4)["\']', # Nested source
-            r'["\'](https?://[^"\']+\.mp4)["\']'  # Any raw mp4 link in quotes (fallback)
+            r'file\s*:\s*["\'](https?://[^"\']+\.mp4)["\']',
+            r'["\'](https?://[^"\']+\.mp4)["\']'
         ]
 
-        mp4_url = None
         for pattern in patterns:
             match = re.search(pattern, html_content)
             if match:
-                mp4_url = match.group(1)
-                break
-        
-        if mp4_url:
-            return mp4_url, None
-        else:
-            return None, "Could not extract the MP4 file. The site format might have changed."
+                return match.group(1), None
+
+        return None, "Could not extract MP4 link. The video might be deleted."
 
 # --- BOT HANDLERS ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "🎬 **StreamA2Z Downloader**\n\n"
-        "Send me a link from `smartkhabrinews.com` OR `streama2z.pro`.\n"
-        "I will extract the hidden video for you."
-    )
+    await message.answer("👋 Send me the **SmartKhabri** link (ending with `#id`) or the **StreamA2Z** link.")
 
 @dp.message(F.text)
-async def handle_video_request(message: types.Message):
+async def handle_request(message: types.Message):
     url = message.text.strip()
-    
-    # Basic validation
-    if not any(x in url for x in ["smartkhabri", "streama2z", "http"]):
-        await message.answer("❌ Invalid link. Please send a supported URL.")
-        return
-
-    status_msg = await message.answer("🔄 **Processing...** accessing the stream host.")
+    status_msg = await message.answer("🔎 **Processing...**")
 
     try:
-        # Run extraction
-        direct_url, error = await extract_mp4(url)
+        mp4_url, error = await extract_mp4(url)
 
         if error:
             await status_msg.edit_text(f"❌ **Error:** {error}")
             return
 
-        await status_msg.edit_text("✅ **Found!** Downloading video to Telegram server...")
+        await status_msg.edit_text("✅ **Found!** Uploading...")
 
-        # Attempt to upload video
+        # Create a custom input file that includes Referer headers for the download
+        # Note: aiogram URLInputFile doesn't support custom headers easily, 
+        # so if this fails, we send the link.
         try:
             await message.answer_video(
-                video=URLInputFile(direct_url, filename="video.mp4"),
-                caption=f"🎥 **Video Downloaded**\n\n🔗 Source: StreamA2Z",
-                supports_streaming=True
+                video=URLInputFile(mp4_url, filename="video.mp4"),
+                caption=f"🎥 **Video Downloaded**\n\n🔗 [Direct Link]({mp4_url})",
+                parse_mode="Markdown"
             )
             await status_msg.delete()
         except Exception as e:
-            # Fallback if file is > 50MB (Telegram Bot API limit)
             await status_msg.edit_text(
-                f"⚠️ **File is too large for Telegram Bot upload.**\n\n"
-                f"🔗 **Direct Link:** {direct_url}\n\n"
-                f"*(Click the link to download manually)*"
+                f"⚠️ **Telegram Upload Failed** (File too big?)\n\n"
+                f"🔗 **Click here to watch/download:**\n{mp4_url}"
             )
 
     except Exception as e:
-        logger.error(f"Critical error: {e}")
-        await status_msg.edit_text("❌ An unexpected error occurred.")
+        logger.error(f"Critical: {e}")
+        await status_msg.edit_text("❌ System Error.")
 
 # --- ENTRY POINT ---
 async def main():
@@ -176,4 +165,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Bot stopped")
+        pass
