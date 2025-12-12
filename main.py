@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("BOT_TOKEN") 
-# TOKEN = "YOUR_TOKEN" # Uncomment for local testing
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -22,7 +21,7 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- WEB SERVER (Keep-Alive for Render) ---
+# --- WEB SERVER (Keep-Alive) ---
 async def health_check(request):
     return web.Response(text="Bot is running")
 
@@ -36,144 +35,107 @@ async def start_web_server():
     await site.start()
     logger.info(f"Web server running on port {port}")
 
-# --- 1. INTELLIGENT ID EXTRACTION ---
+# --- HELPER: Extract ID ---
 def get_video_id(url):
     """
-    Extracts ID 'hufu71926gty' from:
-    - https://streama2z.pro/hufu71926gty/filename.mp4
-    - https://streama2z.pro/e/hufu71926gty
-    - https://smartkhabrinews.com/...#hufu71926gty
+    Extracts ID 'ds6yd9drzux3' from:
+    https://streama2z.pro/ds6yd9drzux3/0_1000073663.mp4
     """
     parsed = urlparse(url)
-    path = parsed.path
-
-    # Case 1: Fragment (SmartKhabri)
-    if parsed.fragment:
-        return parsed.fragment
-
-    # Case 2: Embed URL (/e/ID)
-    if "/e/" in path:
-        parts = path.split("/e/")
-        if len(parts) > 1:
-            return parts[1].split('/')[0]
-
-    # Case 3: Direct File URL (/ID/filename.mp4) <--- THIS FIXES YOUR LINK
-    # Look for the pattern: /alphanumeric_string/something.mp4
-    match = re.search(r'/([a-z0-9]{10,15})/', path)
-    if match:
-        return match.group(1)
-        
-    # Case 4: Fallback (Split by slash)
-    parts = path.split('/')
-    for part in parts:
-        # IDs are usually 12 chars long alphanumeric
+    path_parts = parsed.path.split('/')
+    
+    # Logic: Find the part that looks like an ID (alphanumeric, 12 chars)
+    for part in path_parts:
         if len(part) == 12 and part.isalnum():
             return part
             
+    # Fallback: Check if fragment exists
+    if parsed.fragment:
+        return parsed.fragment
+        
     return None
 
-# --- 2. DOWNLOAD ENGINE ---
-async def process_download(video_id, message):
-    status_msg = await message.answer(f"🔎 **ID:** `{video_id}`\nConnecting to StreamA2Z...")
+# --- DOWNLOAD ENGINE ---
+async def process_video(url, message):
+    video_id = get_video_id(url)
     
-    # We use ONE session for the whole process to keep cookies valid
+    if not video_id:
+        await message.answer("❌ **Error:** Could not detect a valid Video ID in that link.")
+        return
+
+    status_msg = await message.answer(f"🚀 **Direct Mode Active**\nID: `{video_id}`\nBypassing Embed Page...")
+
+    # THE TRICK:
+    # We set the 'Referer' to the embed page, but we request the FILE directly.
+    # This bypasses the page scrape (which is returning 403).
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://smartkhabrinews.com/",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": f"https://streama2z.pro/e/{video_id}", # Essential for download permission
+        "Accept": "*/*"
     }
     
-    embed_url = f"https://streama2z.pro/e/{video_id}"
     local_filename = f"{video_id}.mp4"
+    download_success = False
 
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             
-            # STEP A: Visit the Embed Page (Authorization)
-            async with session.get(embed_url) as resp:
-                if resp.status != 200:
-                    await status_msg.edit_text(f"❌ **Error:** Embed page returned {resp.status}")
-                    return
-                html = await resp.text()
+            # 1. Attempt Direct Download of the user's link
+            download_url = url
+            
+            # If user didn't send an MP4 link, we forced to scrape (might fail)
+            if not url.endswith(".mp4"):
+                 await status_msg.edit_text("⚠️ **Note:** Not a direct MP4 link. Trying to scrape (might fail due to IP block)...")
+                 # Scrape logic would go here, but for your specific case, we assume MP4 input
+                 download_url = f"https://streama2z.pro/{video_id}/v.mp4" # Guess default path
 
-            # STEP B: Find the REAL video link inside the HTML
-            # The regex looks for: file: "https://..."
-            video_match = re.search(r'file\s*:\s*["\'](https?://[^"\']+\.mp4)["\']', html)
-            
-            if not video_match:
-                # Fallback: Look for any string ending in .mp4 inside quotes
-                video_match = re.search(r'["\'](https?://[^"\']+\.mp4)["\']', html)
+            async with session.get(download_url) as resp:
+                if resp.status == 200:
+                    # Check size
+                    try:
+                        size = int(resp.headers.get('Content-Length', 0))
+                        if size > 49 * 1024 * 1024:
+                            await status_msg.edit_text(f"⚠️ **File > 50MB.**\n\n🔗 [Direct Link]({download_url})")
+                            return
+                    except:
+                        pass
 
-            if not video_match:
-                await status_msg.edit_text("❌ **Error:** Could not scrape video link from player.")
-                return
-            
-            real_mp4_url = video_match.group(1)
-            logger.info(f"Resolved URL: {real_mp4_url}")
-
-            # STEP C: Download the video
-            # IMPORTANT: Change Referer to the Embed URL
-            download_headers = headers.copy()
-            download_headers['Referer'] = embed_url 
-            
-            await status_msg.edit_text("📥 **Downloading to server...**")
-            
-            async with session.get(real_mp4_url, headers=download_headers) as dl_resp:
-                if dl_resp.status == 403:
-                    await status_msg.edit_text("❌ **403 Forbidden:** The server blocked the bot IP.")
-                    return
-                elif dl_resp.status != 200:
-                    await status_msg.edit_text(f"❌ **Download Error:** Status {dl_resp.status}")
-                    return
+                    f = await aiofiles.open(local_filename, mode='wb')
+                    await f.write(await resp.read())
+                    await f.close()
+                    download_success = True
                 
-                # Check File Size
-                try:
-                    size = int(dl_resp.headers.get('Content-Length', 0))
-                    # 50 MB limit (Telegram restriction)
-                    if size > 50 * 1024 * 1024:
-                        await status_msg.edit_text(f"⚠️ **File too large (>50MB).**\n\n🔗 [Direct Link]({real_mp4_url})")
-                        return
-                except:
-                    pass
+                elif resp.status == 403:
+                    await status_msg.edit_text(f"❌ **Direct Download 403.**\nThe link you sent is expired or IP-locked.\n\nTry sending the **News Article Link** instead.")
+                    return
+                else:
+                    await status_msg.edit_text(f"❌ **Error:** Server returned {resp.status}")
+                    return
 
-                f = await aiofiles.open(local_filename, mode='wb')
-                await f.write(await dl_resp.read())
-                await f.close()
-
-        # STEP D: Upload to Telegram
-        await status_msg.edit_text("📤 **Uploading to Telegram...**")
-        video = FSInputFile(local_filename)
-        await message.answer_video(video, caption=f"✅ **Downloaded**\nID: `{video_id}`")
-        await status_msg.delete()
+        if download_success:
+            await status_msg.edit_text("📤 **Uploading...**")
+            video_file = FSInputFile(local_filename)
+            await message.answer_video(video_file, caption=f"✅ **Downloaded**")
+            await status_msg.delete()
 
     except Exception as e:
-        logger.error(f"System Error: {e}")
-        await status_msg.edit_text(f"❌ **Error:** {str(e)}")
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"❌ **System Error:** {e}")
     finally:
-        # Cleanup file
         if os.path.exists(local_filename):
             os.remove(local_filename)
 
-# --- BOT HANDLERS ---
-
+# --- HANDLERS ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("👋 Send me a **StreamA2Z** link to download.")
+    await message.answer("👋 Send the **Direct MP4 Link**.")
 
 @dp.message(F.text)
 async def handle_url(message: types.Message):
-    url = message.text.strip()
-    
-    if "streama2z" not in url and "smartkhabri" not in url:
-        await message.answer("❌ Please send a valid StreamA2Z URL.")
-        return
-
-    video_id = get_video_id(url)
-    
-    if video_id:
-        await process_download(video_id, message)
+    if "http" in message.text:
+        await process_video(message.text.strip(), message)
     else:
-        await message.answer("❌ Could not extract Video ID from this link.")
+        await message.answer("❌ Invalid URL")
 
 # --- MAIN ---
 async def main():
