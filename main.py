@@ -50,18 +50,31 @@ def get_id_from_url(url):
             return part
     return None
 
-async def download_file(url, headers, filename="temp_video.mp4"):
-    """Downloads the file locally to bypass 403 errors."""
+async def download_file_locally(url, referer, filename):
+    """
+    Downloads the file to the local disk using the correct Referer header.
+    Returns: True if success, "TOO_BIG" if > 50MB, False if failed.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": referer,
+        "Origin": "https://streama2z.pro" # Sometimes needed
+    }
+    
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
+                    logger.error(f"Download Error Status: {resp.status}")
                     return False
                 
-                # Check file size (Limit to ~50MB for Bot API)
-                size = int(resp.headers.get('Content-Length', 0))
-                if size > 49 * 1024 * 1024: # 49 MB limit safety
-                    return "TOO_BIG"
+                # Check size (50MB limit for Bot API)
+                try:
+                    size = int(resp.headers.get('Content-Length', 0))
+                    if size > 49 * 1024 * 1024: 
+                        return "TOO_BIG"
+                except:
+                    pass # Content-length might be missing, try anyway
 
                 f = await aiofiles.open(filename, mode='wb')
                 await f.write(await resp.read())
@@ -74,83 +87,92 @@ async def download_file(url, headers, filename="temp_video.mp4"):
 # --- CORE LOGIC ---
 
 async def process_video(url, message):
-    status_msg = await message.answer("🔎 **Analyzing link...**")
+    status_msg = await message.answer("🔎 **Processing...**")
     
-    # 1. Get Video ID
-    video_id = get_id_from_url(url)
-    if not video_id:
-        await status_msg.edit_text("❌ **Error:** Could not find a Video ID in the link.\nMake sure the link ends with `#id`.")
-        return
+    final_mp4_url = None
+    referer_for_download = "https://smartkhabrinews.com/"
 
-    # 2. Construct Embed URL and Headers
-    embed_url = f"https://streama2z.pro/e/{video_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://smartkhabrinews.com/",
-        "Origin": "https://smartkhabrinews.com"
-    }
+    # --- SCENARIO 1: Direct MP4 Link ---
+    if url.endswith(".mp4"):
+        final_mp4_url = url
+        # If it's a direct link, the referer is usually the domain root
+        referer_for_download = "https://streama2z.pro/"
+    
+    # --- SCENARIO 2: SmartKhabri / StreamA2Z Embed Link ---
+    else:
+        video_id = get_id_from_url(url)
+        if not video_id:
+            await status_msg.edit_text("❌ **Error:** Could not find a Video ID. Make sure URL ends with `#id`.")
+            return
 
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            # 3. Fetch Embed Page to get real MP4 link
-            async with session.get(embed_url) as resp:
-                if resp.status != 200:
-                    await status_msg.edit_text(f"❌ **Error:** Stream host returned {resp.status}.")
-                    return
-                html = await resp.text()
-
-            # 4. Extract MP4 URL using Regex
-            # Pattern matches: file: "https://...mp4"
+        embed_url = f"https://streama2z.pro/e/{video_id}"
+        
+        # Scrape the MP4 from the embed page
+        scrape_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://smartkhabrinews.com/"
+        }
+        
+        try:
+            async with aiohttp.ClientSession(headers=scrape_headers) as session:
+                async with session.get(embed_url) as resp:
+                    if resp.status != 200:
+                        await status_msg.edit_text(f"❌ **Error:** Stream host returned {resp.status}")
+                        return
+                    html = await resp.text()
+            
+            # Find MP4
             match = re.search(r'file\s*:\s*["\'](https?://[^"\']+\.mp4)["\']', html)
             if not match:
-                # Fallback pattern
                 match = re.search(r'["\'](https?://[^"\']+\.mp4)["\']', html)
             
-            if not match:
-                await status_msg.edit_text("❌ **Error:** Could not extract video URL from player.")
+            if match:
+                final_mp4_url = match.group(1)
+                referer_for_download = embed_url # Important: Set referer to embed page
+            else:
+                await status_msg.edit_text("❌ **Error:** Could not extract video URL.")
                 return
-            
-            mp4_url = match.group(1)
-            logger.info(f"Found MP4: {mp4_url}")
+                
+        except Exception as e:
+            await status_msg.edit_text(f"❌ **Scrape Error:** {str(e)}")
+            return
 
-            # 5. Update headers for the video file itself (Referer must be the embed URL)
-            headers['Referer'] = embed_url
-            
-            await status_msg.edit_text("📥 **Downloading video to server...**\n(This bypasses the 403 error)")
-            
-            # 6. Download Locally
-            local_filename = f"{video_id}.mp4"
-            result = await download_file(mp4_url, headers, local_filename)
+    # --- DOWNLOAD AND SEND ---
+    
+    if final_mp4_url:
+        local_filename = f"vid_{message.from_user.id}.mp4"
+        
+        await status_msg.edit_text("📥 **Downloading to server...**\n(Bypassing 403 Forbidden)")
+        
+        result = await download_file_locally(final_mp4_url, referer_for_download, local_filename)
+        
+        if result == "TOO_BIG":
+            await status_msg.edit_text(f"⚠️ **Video > 50MB.** Telegram Bots can't upload big files.\n\n🔗 [Direct Link]({final_mp4_url})")
+            if os.path.exists(local_filename): os.remove(local_filename)
+            return
+        
+        elif result is False:
+            await status_msg.edit_text("❌ **Download Failed.** Host rejected connection.")
+            if os.path.exists(local_filename): os.remove(local_filename)
+            return
 
-            if result == "TOO_BIG":
-                await status_msg.edit_text(f"⚠️ **Video is too large (>50MB).**\nTelegram Bots cannot upload it.\n\n🔗 [Direct Link]({mp4_url})")
-                return
-            elif not result:
-                await status_msg.edit_text("❌ **Download Failed.** The link might be expired.")
-                return
-
-            # 7. Upload to Telegram
-            await status_msg.edit_text("📤 **Uploading to Telegram...**")
-            
+        # Upload
+        await status_msg.edit_text("📤 **Uploading to Telegram...**")
+        try:
             video_file = FSInputFile(local_filename)
-            await message.answer_video(video_file, caption="🎥 **Downloaded via Bot**")
-            
-            # Cleanup
+            await message.answer_video(video_file, caption="✅ **Downloaded successfully**")
+        except Exception as e:
+            await message.answer(f"❌ **Upload Error:** {e}")
+        finally:
             await status_msg.delete()
             if os.path.exists(local_filename):
                 os.remove(local_filename)
-
-    except Exception as e:
-        logger.error(f"Critical error: {e}")
-        await status_msg.edit_text("❌ **System Error:** " + str(e))
-        if os.path.exists(f"{video_id}.mp4"):
-            os.remove(f"{video_id}.mp4")
 
 # --- BOT HANDLERS ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("👋 **Send me a SmartKhabri link!**\nMake sure it has the `#id` at the end.")
+    await message.answer("👋 Send me the link!")
 
 @dp.message(F.text)
 async def handle_url(message: types.Message):
