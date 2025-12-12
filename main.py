@@ -2,8 +2,7 @@ import os
 import re
 import asyncio
 import logging
-import aiohttp
-import aiofiles
+import cloudscraper
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -35,100 +34,118 @@ async def start_web_server():
     await site.start()
     logger.info(f"Web server running on port {port}")
 
-# --- HELPER: Extract ID ---
+# --- HELPER: Get ID ---
 def get_video_id(url):
-    """
-    Extracts ID 'ds6yd9drzux3' from:
-    https://streama2z.pro/ds6yd9drzux3/0_1000073663.mp4
-    """
     parsed = urlparse(url)
+    if parsed.fragment: return parsed.fragment
     path_parts = parsed.path.split('/')
-    
-    # Logic: Find the part that looks like an ID (alphanumeric, 12 chars)
     for part in path_parts:
-        if len(part) == 12 and part.isalnum():
-            return part
-            
-    # Fallback: Check if fragment exists
-    if parsed.fragment:
-        return parsed.fragment
-        
+        if len(part) > 8 and part.isalnum(): return part
     return None
 
-# --- DOWNLOAD ENGINE ---
-async def process_video(url, message):
-    video_id = get_video_id(url)
+# --- BROWSER ENGINE (CLOUDSCRAPER) ---
+def download_logic_sync(video_id):
+    """
+    This runs synchronously using Cloudscraper to mimic a real Chrome browser.
+    It bypasses the 403 error.
+    """
+    # 1. Create a "Browser" instance
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
     
-    if not video_id:
-        await message.answer("❌ **Error:** Could not detect a valid Video ID in that link.")
-        return
-
-    status_msg = await message.answer(f"🚀 **Direct Mode Active**\nID: `{video_id}`\nBypassing Embed Page...")
-
-    # THE TRICK:
-    # We set the 'Referer' to the embed page, but we request the FILE directly.
-    # This bypasses the page scrape (which is returning 403).
+    embed_url = f"https://streama2z.pro/e/{video_id}"
+    local_filename = f"{video_id}.mp4"
+    
+    # 2. Visit Embed Page (Bypass 403)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": f"https://streama2z.pro/e/{video_id}", # Essential for download permission
-        "Accept": "*/*"
+        "Referer": "https://smartkhabrinews.com/",
+        "Origin": "https://smartkhabrinews.com"
     }
     
-    local_filename = f"{video_id}.mp4"
-    download_success = False
-
     try:
-        async with aiohttp.ClientSession(headers=headers) as session:
+        # Get the HTML of the player
+        response = scraper.get(embed_url, headers=headers)
+        if response.status_code != 200:
+            return None, f"Embed Page Blocked: {response.status_code}"
+        
+        html = response.text
+        
+        # 3. Extract the MP4 Link
+        match = re.search(r'file\s*:\s*["\'](https?://[^"\']+\.mp4)["\']', html)
+        if not match:
+             match = re.search(r'["\'](https?://[^"\']+\.mp4)["\']', html)
+        
+        if not match:
+            return None, "Could not find video link in HTML."
+        
+        mp4_url = match.group(1)
+        
+        # 4. Download the File
+        # IMPORTANT: Update referer to the embed page
+        headers['Referer'] = embed_url
+        
+        with scraper.get(mp4_url, headers=headers, stream=True) as r:
+            if r.status_code == 403:
+                return None, "Video File Forbidden (403)"
+            r.raise_for_status()
             
-            # 1. Attempt Direct Download of the user's link
-            download_url = url
-            
-            # If user didn't send an MP4 link, we forced to scrape (might fail)
-            if not url.endswith(".mp4"):
-                 await status_msg.edit_text("⚠️ **Note:** Not a direct MP4 link. Trying to scrape (might fail due to IP block)...")
-                 # Scrape logic would go here, but for your specific case, we assume MP4 input
-                 download_url = f"https://streama2z.pro/{video_id}/v.mp4" # Guess default path
-
-            async with session.get(download_url) as resp:
-                if resp.status == 200:
-                    # Check size
-                    try:
-                        size = int(resp.headers.get('Content-Length', 0))
-                        if size > 49 * 1024 * 1024:
-                            await status_msg.edit_text(f"⚠️ **File > 50MB.**\n\n🔗 [Direct Link]({download_url})")
-                            return
-                    except:
-                        pass
-
-                    f = await aiofiles.open(local_filename, mode='wb')
-                    await f.write(await resp.read())
-                    await f.close()
-                    download_success = True
+            # Check size
+            size = int(r.headers.get('Content-Length', 0))
+            if size > 49 * 1024 * 1024:
+                return None, f"Video too large (>50MB). Link: {mp4_url}"
                 
-                elif resp.status == 403:
-                    await status_msg.edit_text(f"❌ **Direct Download 403.**\nThe link you sent is expired or IP-locked.\n\nTry sending the **News Article Link** instead.")
-                    return
-                else:
-                    await status_msg.edit_text(f"❌ **Error:** Server returned {resp.status}")
-                    return
-
-        if download_success:
-            await status_msg.edit_text("📤 **Uploading...**")
-            video_file = FSInputFile(local_filename)
-            await message.answer_video(video_file, caption=f"✅ **Downloaded**")
-            await status_msg.delete()
-
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    
+        return local_filename, None
+        
     except Exception as e:
-        logger.error(f"Error: {e}")
-        await status_msg.edit_text(f"❌ **System Error:** {e}")
-    finally:
-        if os.path.exists(local_filename):
-            os.remove(local_filename)
+        return None, str(e)
 
-# --- HANDLERS ---
+# --- ASYNC WRAPPER ---
+async def process_video(url, message):
+    video_id = get_video_id(url)
+    if not video_id:
+        await message.answer("❌ No ID found. Send the SmartKhabri link ending in `#id`")
+        return
+
+    status_msg = await message.answer(f"🛡️ **Bypassing Protection...**\nID: `{video_id}`")
+    
+    # Run the blocking cloudscraper code in a separate thread so the bot doesn't freeze
+    loop = asyncio.get_running_loop()
+    filename, error = await loop.run_in_executor(None, download_logic_sync, video_id)
+    
+    if error:
+        # If error contains "Link:", it means file was too big, but we have the link
+        if "Link:" in error:
+            link = error.split("Link: ")[1]
+            await status_msg.edit_text(f"⚠️ **File too big for Telegram.**\n\n🔗 [Click to Download]({link})")
+        else:
+            await status_msg.edit_text(f"❌ **Error:** {error}")
+        return
+
+    await status_msg.edit_text("📤 **Uploading...**")
+    
+    try:
+        video_file = FSInputFile(filename)
+        await message.answer_video(video_file, caption=f"✅ **Downloaded**")
+    except Exception as e:
+        await message.answer(f"❌ Upload Error: {e}")
+    finally:
+        await status_msg.delete()
+        if os.path.exists(filename):
+            os.remove(filename)
+
+# --- BOT HANDLERS ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("👋 Send the **Direct MP4 Link**.")
+    await message.answer("👋 **Cloudscraper Mode Active**\nSend the **SmartKhabri News Link**.")
 
 @dp.message(F.text)
 async def handle_url(message: types.Message):
