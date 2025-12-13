@@ -22,7 +22,7 @@ dp = Dispatcher()
 
 # --- WEB SERVER ---
 async def health_check(request):
-    return web.Response(text="Stealth Bot Running")
+    return web.Response(text="Recording Bot Running")
 
 async def start_web_server():
     app = web.Application()
@@ -43,92 +43,98 @@ def get_video_id(url):
     if parsed.fragment: return parsed.fragment
     return None
 
-# --- BROWSER ENGINE: STEALTH MODE ---
+# --- BROWSER ENGINE: VIDEO RECORDING MODE ---
 async def extract_and_download(video_id, message):
-    status_msg = await message.answer(f"🥷 **Stealth Mode Active...**\nTarget ID: `{video_id}`")
+    status_msg = await message.answer(f"🎥 **Recording Session...**\nTarget ID: `{video_id}`")
     
     embed_url = f"https://streama2z.pro/e/{video_id}"
-    screenshot_file = f"debug_{video_id}.png"
     local_video_file = f"{video_id}.mp4"
+    recording_path = None # Will store path to recorded .webm
     found_url = None
 
     try:
         async with async_playwright() as p:
-            # 1. Launch with Stealth Arguments
+            # 1. Launch Browser
             browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled", # Hides "controlled by automation"
-                    "--no-sandbox",
-                    "--disable-infobars"
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
             )
             
-            # 2. Mimic a Real PC
+            # 2. Enable Video Recording
+            # We save videos to a folder named "recordings"
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 720},
-                locale="en-US"
+                record_video_dir="recordings/" 
             )
             
             page = await context.new_page()
             
-            # 3. Inject Script to Remove 'navigator.webdriver' property (Crucial for Cloudflare)
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-            """)
+            # Anti-detection script
+            await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-            # --- NETWORK LISTENER ---
+            # --- NETWORK SNIFFER ---
             async def handle_request(request):
                 nonlocal found_url
-                if ".mp4" in request.url and "streama2z" in request.url:
+                # Look for MP4 or M3U8 (sometimes they use HLS)
+                if ("streama2z" in request.url) and (".mp4" in request.url or ".m3u8" in request.url):
                     found_url = request.url
                     logger.info(f"SNIFFED: {found_url}")
 
             page.on("request", handle_request)
             # ------------------------
 
-            await status_msg.edit_text("⏳ **Bypassing Cloudflare...**\n(Moving mouse & waiting)")
+            await status_msg.edit_text("⏳ **Loading Page...**")
             
             try:
-                # Go to page
                 await page.goto(embed_url, referer="https://smartkhabrinews.com/")
                 
-                # 4. Human Behavior Simulation (Wait + Mouse Wiggle)
-                for i in range(10):
-                    # Move mouse randomly to prove we are human
-                    x = random.randint(100, 700)
-                    y = random.randint(100, 500)
-                    await page.mouse.move(x, y)
-                    await page.wait_for_timeout(1500) # Wait 1.5s between moves
-                    
-                    # If we found the url early, stop waiting
-                    if found_url: break
+                # Wait & Wiggle Mouse (to show in video)
+                for _ in range(5):
+                    await page.mouse.move(random.randint(100, 1000), random.randint(100, 600))
+                    await page.wait_for_timeout(1000)
+
+                # CLICK LOGIC
+                await status_msg.edit_text("▶️ **Clicking Play...**")
+                
+                # 1. Try clicking the big play button class if it exists
+                if await page.query_selector(".jw-display-icon-container"):
+                     await page.click(".jw-display-icon-container")
+                # 2. Fallback: Click Dead Center
+                else:
+                    await page.mouse.click(640, 360)
+
+                # Wait for video to start loading
+                await page.wait_for_timeout(5000)
 
             except Exception as e:
-                logger.error(f"Nav Error: {e}")
+                logger.error(f"Browser Error: {e}")
 
-            # 5. Take Screenshot of what happened after waiting
-            await page.screenshot(path=screenshot_file, full_page=True)
-
-            # 6. Click Play if URL not found yet
-            if not found_url:
-                await status_msg.edit_text("▶️ **Clicking Play...**")
-                try:
-                    # Click center
-                    await page.mouse.click(640, 360)
-                    await page.wait_for_timeout(4000)
-                except: pass
+            # Close context to save the video file
+            await context.close() 
+            
+            # Find the recorded video file (Playwright generates random names)
+            # We look in the 'recordings' folder
+            files = os.listdir("recordings")
+            if files:
+                recording_path = os.path.join("recordings", files[0])
 
             await browser.close()
 
+            # --- SEND RECORDING TO USER ---
+            await status_msg.edit_text("📤 **Sending Session Recording...**")
+            if recording_path and os.path.exists(recording_path):
+                vid = FSInputFile(recording_path, filename="bot_view.webm")
+                await message.answer_video(vid, caption="👀 **This is what the bot saw.**")
+                
+                # Clean up recording
+                os.remove(recording_path)
+
             # --- PROCESS RESULT ---
             if found_url:
-                await status_msg.edit_text("✅ **Success! Video Link Found.**\nDownloading...")
+                await message.answer(f"✅ **Link Found!**\n`{found_url}`\n\nAttempting Download...")
                 
-                # Download
+                # Download logic
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
                     "Referer": embed_url 
@@ -140,28 +146,24 @@ async def extract_and_download(video_id, message):
                             await f.write(await resp.read())
                             await f.close()
                             
-                            await status_msg.edit_text("📤 **Uploading...**")
-                            vid = FSInputFile(local_video_file)
-                            await message.answer_video(vid, caption="✅ **Downloaded via Stealth Mode**")
+                            vid_file = FSInputFile(local_video_file)
+                            await message.answer_video(vid_file, caption="✅ **Final Video**")
+                            os.remove(local_video_file)
                         else:
-                            await status_msg.edit_text("❌ Download Failed (Link Expired/Blocked).")
+                            await message.answer("❌ Download Link Expired/Blocked.")
             else:
-                # Send screenshot of failure
-                await status_msg.edit_text("❌ **Still Stuck.** See screenshot.")
-                if os.path.exists(screenshot_file):
-                    photo = FSInputFile(screenshot_file)
-                    await message.answer_photo(photo, caption="📸 **Current Screen**")
+                await message.answer("❌ **Still could not sniff the link.** Check the video above to see why!")
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ **Error:** {e}")
-    finally:
-        if os.path.exists(screenshot_file): os.remove(screenshot_file)
+        await status_msg.edit_text(f"❌ **System Error:** {e}")
+        # Cleanup
+        if recording_path and os.path.exists(recording_path): os.remove(recording_path)
         if os.path.exists(local_video_file): os.remove(local_video_file)
 
 # --- HANDLERS ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("🥷 **Stealth Mode**\nSend link to test.")
+    await message.answer("🎥 **Debug Mode**\nSend link to see a video of the bot's attempt.")
 
 @dp.message(F.text)
 async def handle_url(message: types.Message):
@@ -175,6 +177,8 @@ async def handle_url(message: types.Message):
 # --- MAIN ---
 async def main():
     await start_web_server()
+    if not os.path.exists("recordings"):
+        os.makedirs("recordings")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
