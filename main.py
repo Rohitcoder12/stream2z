@@ -1,4 +1,5 @@
 import os
+import asyncio # <--- Added this missing import
 import logging
 import aiohttp
 from aiohttp import web
@@ -36,7 +37,6 @@ async def debug_link(url, message):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        # We purposely leave Referer empty to see what happens, or you can set it to smartkhabri
         "Referer": "https://smartkhabrinews.com/" 
     }
 
@@ -75,7 +75,6 @@ async def debug_link(url, message):
                 await status_msg.edit_text(report)
 
                 # 4. Create a 'Screenshot' (HTML File)
-                # If it's an error page, we save the HTML so you can open it and see the error.
                 if "text" in content_type or "html" in content_type:
                     filename = "what_bot_saw.html"
                     with open(filename, "w", encoding="utf-8") as f:
