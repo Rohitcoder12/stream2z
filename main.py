@@ -22,7 +22,7 @@ dp = Dispatcher()
 
 # --- WEB SERVER ---
 async def health_check(request):
-    return web.Response(text="Recording Bot Running")
+    return web.Response(text="Mobile Bot Running")
 
 async def start_web_server():
     app = web.Application()
@@ -43,100 +43,92 @@ def get_video_id(url):
     if parsed.fragment: return parsed.fragment
     return None
 
-# --- BROWSER ENGINE: VIDEO RECORDING MODE ---
+# --- BROWSER ENGINE: MOBILE MODE ---
 async def extract_and_download(video_id, message):
-    status_msg = await message.answer(f"🎥 **Recording Session...**\nTarget ID: `{video_id}`")
+    status_msg = await message.answer(f"📱 **Mobile Mode Active...**\nTarget ID: `{video_id}`")
     
     embed_url = f"https://streama2z.pro/e/{video_id}"
     local_video_file = f"{video_id}.mp4"
-    recording_path = None # Will store path to recorded .webm
+    recording_path = None
     found_url = None
 
     try:
         async with async_playwright() as p:
-            # 1. Launch Browser
+            # 1. Setup Mobile Emulation (Pixel 5)
+            # This makes the bot look EXACTLY like your phone
+            pixel_5 = p.devices['Pixel 5']
+            
             browser = await p.chromium.launch(
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
             )
             
-            # 2. Enable Video Recording
-            # We save videos to a folder named "recordings"
+            # Create Context with Video Recording
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 720},
-                record_video_dir="recordings/" 
+                **pixel_5, # Apply phone settings
+                record_video_dir="recordings/",
+                user_agent="Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36"
             )
             
             page = await context.new_page()
             
-            # Anti-detection script
+            # Anti-detection
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             # --- NETWORK SNIFFER ---
             async def handle_request(request):
                 nonlocal found_url
-                # Look for MP4 or M3U8 (sometimes they use HLS)
-                if ("streama2z" in request.url) and (".mp4" in request.url or ".m3u8" in request.url):
+                # Look for the video file request
+                if ("streama2z" in request.url) and (".mp4" in request.url):
                     found_url = request.url
                     logger.info(f"SNIFFED: {found_url}")
 
             page.on("request", handle_request)
             # ------------------------
 
-            await status_msg.edit_text("⏳ **Loading Page...**")
+            await status_msg.edit_text("⏳ **Loading Page (Mobile View)...**")
             
             try:
                 await page.goto(embed_url, referer="https://smartkhabrinews.com/")
                 
-                # Wait & Wiggle Mouse (to show in video)
-                for _ in range(5):
-                    await page.mouse.move(random.randint(100, 1000), random.randint(100, 600))
-                    await page.wait_for_timeout(1000)
+                # Wait for initial load
+                await page.wait_for_timeout(4000)
 
-                # CLICK LOGIC
-                await status_msg.edit_text("▶️ **Clicking Play...**")
+                # --- AD BYPASS LOGIC ---
+                await status_msg.edit_text("👆 **Tapping Play (Attempt 1)...**")
                 
-                # 1. Try clicking the big play button class if it exists
-                if await page.query_selector(".jw-display-icon-container"):
-                     await page.click(".jw-display-icon-container")
-                # 2. Fallback: Click Dead Center
-                else:
-                    await page.mouse.click(640, 360)
-
-                # Wait for video to start loading
+                # Tap the center of the phone screen
+                await page.mouse.click(196, 425) 
+                
+                # Wait 2 seconds (This usually triggers the popup/ad)
+                await page.wait_for_timeout(2000)
+                
+                # Tap AGAIN (This usually starts the video after ad is cleared)
+                await status_msg.edit_text("👆 **Tapping Play (Attempt 2)...**")
+                await page.mouse.click(196, 425)
+                
+                # Wait for video network request
                 await page.wait_for_timeout(5000)
 
             except Exception as e:
                 logger.error(f"Browser Error: {e}")
 
-            # Close context to save the video file
             await context.close() 
             
-            # Find the recorded video file (Playwright generates random names)
-            # We look in the 'recordings' folder
+            # Save recording for debugging
             files = os.listdir("recordings")
             if files:
                 recording_path = os.path.join("recordings", files[0])
 
             await browser.close()
 
-            # --- SEND RECORDING TO USER ---
-            await status_msg.edit_text("📤 **Sending Session Recording...**")
-            if recording_path and os.path.exists(recording_path):
-                vid = FSInputFile(recording_path, filename="bot_view.webm")
-                await message.answer_video(vid, caption="👀 **This is what the bot saw.**")
-                
-                # Clean up recording
-                os.remove(recording_path)
-
-            # --- PROCESS RESULT ---
+            # --- RESULT ---
             if found_url:
-                await message.answer(f"✅ **Link Found!**\n`{found_url}`\n\nAttempting Download...")
+                await status_msg.edit_text(f"✅ **Link Sniffed!**\n`{found_url}`\n\nDownloading...")
                 
                 # Download logic
                 headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
                     "Referer": embed_url 
                 }
                 async with aiohttp.ClientSession(headers=headers) as session:
@@ -147,23 +139,29 @@ async def extract_and_download(video_id, message):
                             await f.close()
                             
                             vid_file = FSInputFile(local_video_file)
-                            await message.answer_video(vid_file, caption="✅ **Final Video**")
+                            await message.answer_video(vid_file, caption="✅ **Downloaded (Mobile Mode)**")
                             os.remove(local_video_file)
                         else:
                             await message.answer("❌ Download Link Expired/Blocked.")
             else:
-                await message.answer("❌ **Still could not sniff the link.** Check the video above to see why!")
+                # If failed, send video to see what happened on the phone screen
+                if recording_path:
+                    vid = FSInputFile(recording_path, filename="mobile_view.webm")
+                    await message.answer_video(vid, caption="❌ **Failed.** Here is the Mobile View recording.")
+
+            # Cleanup recording
+            if recording_path and os.path.exists(recording_path):
+                os.remove(recording_path)
 
     except Exception as e:
         await status_msg.edit_text(f"❌ **System Error:** {e}")
-        # Cleanup
         if recording_path and os.path.exists(recording_path): os.remove(recording_path)
         if os.path.exists(local_video_file): os.remove(local_video_file)
 
 # --- HANDLERS ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("🎥 **Debug Mode**\nSend link to see a video of the bot's attempt.")
+    await message.answer("📱 **Mobile Debug Mode**\nSend link.")
 
 @dp.message(F.text)
 async def handle_url(message: types.Message):
